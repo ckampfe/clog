@@ -20,8 +20,8 @@
 (def db-write-handler
   (transit/write-handler "datascript-db"
                          (fn [d]
-                           {:datoms (map (fn [^datascript.db.Datom d] [(.-e d) (.-a d) (.-v d) (.-tx d)])
-                                         (datascript.db/-datoms d :eavt []))
+                           {:datoms (pmap (fn [^datascript.db.Datom d] [(.-e d) (.-a d) (.-v d) (.-tx d)])
+                                          (datascript.db/-datoms d :eavt []))
                             :schema (datascript.db/-schema d)})))
 
 (def db-read-handler
@@ -49,23 +49,23 @@
 
 (defn csv-data->maps [csv-data]
   (cons (first csv-data)
-        (map zipmap
-             (->> (first csv-data)
-                  (map keyword)
-                  repeat)
-             (rest csv-data))))
+        (pmap zipmap
+              (->> (first csv-data)
+                   (map keyword)
+                   repeat)
+              (rest csv-data))))
 
 (defn coerce-row-types [rows typemap]
   (let [header (first rows)
         typemap (clojure.edn/read-string typemap)]
-    (map (fn [row]
-           (reduce (fn [acc [k f]]
-                     (update acc
-                             k
-                             #((get coercions f) %)))
-                   row
-                   typemap))
-         (rest rows))))
+    (pmap (fn [row]
+            (reduce (fn [acc [k f]]
+                      (update acc
+                              k
+                              #((get coercions f) %)))
+                    row
+                    typemap))
+          (rest rows))))
 
 (defn create-db [rows]
   (let [headers (keys (first rows))
@@ -86,44 +86,32 @@
 (defn index-exists? [file]
   (.exists (io/as-file file)))
 
-(defn write-index [file typemap]
+(defn write-index [file {:keys [typemap csv-separator csv-quote]
+                         :or {typemap {}
+                              csv-separator \,
+                              csv-quote \"}}]
   (with-open [rdr (io/reader file)]
-    (let [rows (csv/read-csv rdr)
+    (let [rows (csv/read-csv rdr
+                             :separator csv-separator
+                             :quote csv-quote)
           rows-as-maps (csv-data->maps rows)
           type-coerced-rows (coerce-row-types rows-as-maps typemap)
           database (create-db type-coerced-rows)]
       (transit-out (str file ".index")
                    @database))))
 
-#_(defn write-index [file typemap]
-    (with-open [rdr (io/reader file)]
-      (let [doc (csv/read-csv rdr)
-            rows-as-maps (csv-data->maps doc)
-            type-coerced-rows (coerce-row-types rows-as-maps typemap)
-            database (create-db type-coerced-rows)]
-
-        (spit (str file ".index")
-              (pr-str @database)))))
-
 (defn show-header [file]
   (with-open [rdr (io/reader file)]
     (let [doc (csv/read-csv rdr)]
       (println (first doc)))))
 
-#_(defn load-database-from-index [file]
-    (->> ".index"
-         (str file)
-         slurp
-         (clojure.edn/read-string {:readers data/data-readers})
-         data/conn-from-db))
-
 (defn load-database-from-index [file]
-  (let [t (transit-in (str file ".index"))]
-    (data/conn-from-db t)
-    #_(data/conn-from-db (datascript.db/db-from-reader t))))
+  (let [index-db (transit-in (str file ".index"))]
+    (data/conn-from-db index-db)))
 
-(defn query [file query-string typemap]
-  (let [query (clojure.edn/read-string query-string)]
+(defn query [file {:keys [query typemap]
+                   :or {typemap {}}}]
+  (let [query (clojure.edn/read-string query)]
     (if (index-exists? (str file ".index"))
       (let [database (load-database-from-index file)]
         (pprint/pprint (data/q query @database)))
@@ -137,35 +125,61 @@
           (pprint/pprint (data/q query @database)))))))
 
 (def cli-options
-  ;; An option with a required argument
-  [["-i" "--index" "Create an index"]
-   ["-t" "--typemap TYPEMAP" "A typemap of transforms"]
-   ["-s" "--show-header" "Show header only"]
-   ["-q" "--query QUERY" "Run a query"]
+  [["-q" "--query QUERY"                 "The query to run"]
+   ["-i" "--index"                       "Create an index"]
+   ["-t" "--typemap TYPEMAP"             "A typemap of transforms"]
+   ["-s" "--csv-separator CSV-SEPARATOR" "CSV separator character" :default \,]
+   ["-u" "--csv-quote CSV-QUOTE"         "CSV quote character" :default \"]
+   ["-o" "--csv-header"                  "Show CSV header only"]
+   ["-v" "--verbose"                     "Verbose mode"]
    ["-h" "--help"]])
 
 (defn exit [status msg]
-  (println msg)
+  (when msg (println msg))
   (System/exit status))
+
+(defn usage [options-summary]
+  (->> ["clog:"
+        ""
+        "Usage: clog [options] file"
+        ""
+        "Options:"
+        ""
+        options-summary]
+       (clojure.string/join \newline)))
 
 (defn -main
   "I don't do a whole lot ... yet."
   [& args]
   (let [{:keys [options arguments errors summary]} (cli/parse-opts args cli-options)]
-    (cond
-      (:help options) (exit 0 summary)
-      (:show-header options) (show-header (first arguments))
-      (and (:index options)
-           (:typemap options)) (write-index (first arguments)
-                                            (:typemap options))
-      (and (:query options)
-           (:typemap options)) (query (first arguments)
-                                      (:query options)
-                                      (:typemap options))
-      :else (println summary)) #_(println options)
-    #_(println arguments)
-    #_(println errors)
-    #_(println summary)))
+    (when (:verbose options)
+      (println options)
+      (println errors))
+
+    (let [return
+          (cond
+            (:help options)
+            {:code 0 :value (usage summary)}
+
+            (= nil (last arguments))
+            {:code 1 :value (usage summary)}
+
+            (:csv-header options)
+            {:code 0 :value (show-header (last arguments))}
+
+            (and (:index options)
+                 (:typemap options))
+            {:code 0 :value (write-index (last arguments) options)}
+
+            (and (:query options)
+                 (:typemap options))
+            {:code 0 :value (query (last arguments) options)}
+
+            :else {:code 1 :value (usage summary)})]
+
+      (shutdown-agents)
+      (exit (:code return)
+            (:value return)))))
 
 (comment
 
