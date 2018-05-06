@@ -6,7 +6,7 @@ Query CSVs with datalog
 
 `$ boot build-native-image`
 
-## Usage
+## Examples
 
 ```
 xcxk066$> wc -l junk.csv
@@ -26,6 +26,26 @@ xcxk066$> ./clog junk.csv -i -t "{:id :to-int}"
 xcxk066$> time ./clog junk.csv -q '[:find ?name (count ?e) :where [?e :name ?name]]' -t '{:id :to-long}'
 (["jill" 2500] ["ernie" 2500] ["sally" 2500] ["bill" 2500])
 ./clog junk.csv -q '[:find ?name (count ?e) :where [?e :name ?name]]' -t   0.14s user 0.03s system 98% cpu 0.175 total
+```
+
+## Usage
+
+```
+xcxk066$> ./clog
+clog:
+
+Usage: clog [options] file
+
+Options:
+
+  -q, --query QUERY                     The query to run
+  -i, --index                           Create an index
+  -t, --typemap TYPEMAP                 A typemap of transforms
+  -s, --csv-separator CSV-SEPARATOR  ,  CSV separator character
+  -u, --csv-quote CSV-QUOTE          "  CSV quote character
+  -o, --csv-header                      Show CSV header only
+  -v, --verbose                         Verbose mode
+  -h, --help
 ```
 
 ## License
