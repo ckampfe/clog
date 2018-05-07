@@ -1,5 +1,6 @@
 (ns clog.core
   (:require [clojure.data.csv :as csv]
+            [clojure.core.reducers :as r]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.tools.cli :as cli]
@@ -21,14 +22,18 @@
   (transit/write-handler "datascript-db"
                          (fn [d]
                            {:datoms (pmap (fn [^datascript.db.Datom d] [(.-e d) (.-a d) (.-v d) (.-tx d)])
-                                          (datascript.db/-datoms d :eavt []))
+                                          ;; this should be configurable, but aevt benches fastes on
+                                          ;; common aggregates I've tested, so that's default for now
+                                          (datascript.db/-datoms d :aevt [])
+                                          #_(datascript.db/-datoms d :eavt [])
+                                          #_(datascript.db/-datoms d :avet []))
                             :schema (datascript.db/-schema d)})))
 
 (def db-read-handler
   (transit/read-handler (fn [r] (datascript.db/db-from-reader r))))
 
 (defn transit-out [file data]
-  (with-open [out (io/output-stream file)]
+  (with-open [out (java.util.zip.DeflaterOutputStream. (io/output-stream file))]
     (let [tw (transit/writer out
                              :json
                              {:handlers {datascript.db.Datom datom-write-handler
@@ -36,7 +41,8 @@
       (transit/write tw data))))
 
 (defn transit-in [file]
-  (with-open [rdr (io/input-stream file)]
+  (with-open [rdr (java.util.zip.InflaterInputStream. (io/input-stream file))]
+
     (let [tr (transit/reader rdr
                              :json
                              {:handlers {"datascript-datom" datom-read-handler
@@ -47,28 +53,26 @@
   {:to-int (fn [i] (Integer/parseInt i))
    :to-long (fn [i] (Long/parseLong i))})
 
-(defn csv-data->maps [csv-data]
-  (cons (first csv-data)
-        (pmap zipmap
-              (->> (first csv-data)
-                   (map keyword)
-                   repeat)
-              (rest csv-data))))
+(defn row->typed-row [header row]
+  (zipmap header row))
 
-(defn coerce-row-types [rows typemap]
+(defn coerce-row-types [typemap row]
+  (reduce (fn [acc [k f]]
+            (update acc
+                    k
+                    #((get coercions f) %)))
+          row
+          typemap))
+
+(defn rows-maps-typemapped [rows typemap]
   (let [header (first rows)
-        typemap (clojure.edn/read-string typemap)]
-    (pmap (fn [row]
-            (reduce (fn [acc [k f]]
-                      (update acc
-                              k
-                              #((get coercions f) %)))
-                    row
-                    typemap))
-          (rest rows))))
+        header-keywords (map keyword header)]
+    (cons header-keywords (r/foldcat (->> (rest rows)
+                                          (r/map (partial row->typed-row header-keywords))
+                                          (r/map (partial coerce-row-types typemap)))))))
 
 (defn create-db [rows]
-  (let [headers (keys (first rows))
+  (let [headers (first rows)
         database (->> headers
                       (reduce (fn [indexes header]
                                 (assoc indexes
@@ -78,8 +82,10 @@
                       data/empty-db
                       data/conn-from-db)]
 
-    (doseq [row rows]
-      (data/transact! database [row]))
+    (dorun (pmap (comp
+                  (partial data/transact! database)
+                  vec)
+                 (partition-all 5000 (rest rows))))
 
     database))
 
@@ -94,8 +100,8 @@
     (let [rows (csv/read-csv rdr
                              :separator csv-separator
                              :quote csv-quote)
-          rows-as-maps (csv-data->maps rows)
-          type-coerced-rows (coerce-row-types rows-as-maps typemap)
+          type-coerced-rows (rows-maps-typemapped rows typemap)
+
           database (create-db type-coerced-rows)]
       (transit-out (str file ".index")
                    @database))))
@@ -111,18 +117,16 @@
 
 (defn query [file {:keys [query typemap]
                    :or {typemap {}}}]
-  (let [query (clojure.edn/read-string query)]
-    (if (index-exists? (str file ".index"))
-      (let [database (load-database-from-index file)]
-        (pprint/pprint (data/q query @database)))
+  (if (index-exists? (str file ".index"))
+    (let [database (load-database-from-index file)]
+      (pprint/pprint (data/q query @database)))
 
-      (with-open [rdr (io/reader file)]
-        (let [rows (csv/read-csv rdr)
-              rows-as-maps (csv-data->maps rows)
-              type-coerced-rows (coerce-row-types rows-as-maps typemap)
-              database (create-db type-coerced-rows)]
+    (with-open [rdr (io/reader file)]
+      (let [rows (csv/read-csv rdr)
+            type-coerced-rows (coerce-row-types rows typemap)
+            database (create-db type-coerced-rows)]
 
-          (pprint/pprint (data/q query @database)))))))
+        (pprint/pprint (data/q query @database))))))
 
 (def cli-options
   [["-q" "--query QUERY"                 "The query to run"]
@@ -169,11 +173,14 @@
 
             (and (:index options)
                  (:typemap options))
-            {:code 0 :value (write-index (last arguments) options)}
+            {:code 0 :value (write-index (last arguments)
+                                         (update options :typemap clojure.edn/read-string))} 
 
             (and (:query options)
                  (:typemap options))
-            {:code 0 :value (query (last arguments) options)}
+            {:code 0 :value (query (last arguments)
+                                   (-> options (update :query clojure.edn/read-string)
+                                       (update :typemap clojure.edn/read-string)))}
 
             :else {:code 1 :value (usage summary)})]
 
@@ -197,12 +204,12 @@
                   "[:find (count ?e) ?name :where [?e :kind \"jolly\"] [?e :name ?name]]"))))
 
   ;; create index
-  (time (-main "/Users/xcxk066/code/clog/junk3.csv" "-i" "-t" "{:id :to-int}"))
+  (time (-main "-i" "-t" "{:id :to-int}" "/Users/xcxk066/code/clog/junk.csv"))
 
   ;; with index
-  (time (dotimes [_ 1]
+  (time (dotimes [_ 15]
           (println
-           (-main "/Users/xcxk066/code/clog/junk3.csv"
+           (-main "/Users/xcxk066/code/clog/junk.csv"
                   "-q"
                   "[:find (count ?e) ?name :where [?e :kind \"jolly\"] [?e :name ?name]]"
                   "-t"
@@ -218,8 +225,8 @@
          "-q"
          "[:find ?id1 ?id2 ?eq-int :where [?e :id ?id1] [?e2 :id ?id2] [(= ?id1 ?id2) ?eq-int] ]")
 
-  (with-open [w (io/writer "junk4.csv")]
-    (csv/write-csv w (->> (zipmap (range 1 10001) (cycle rows))
+  (with-open [w (io/writer "junk6.csv")]
+    (csv/write-csv w (->> (zipmap (range 1 200001) (cycle rows))
                           (map (fn [[k v]] (vec (cons k v))))
                           (sort-by (fn [row] (first row)))
                           vec)))
